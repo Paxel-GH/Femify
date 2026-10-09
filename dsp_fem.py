@@ -1,21 +1,3 @@
-"""DSP for Femify: gain (1.5x-5.0x) -> 5-band EQ -> extras -> soft limiter.
-
-Fresh rewrite inspired by Spotify Enhancer's dsp.py, retuned for Femtanyl:
-distorted 808s, fast breaks, pitched-up vocals, already-hot masters.
-
-Chain per block:
-  1. gain (hearing range, default 2.0x)
-  2. DC blocker (10 Hz highpass, always on — kills low-end wander)
-  3. 5-band graphic EQ + optional de-harsh @4kHz in ONE filter pass
-  4. mono bass <120Hz (optional, on by default)
-  5. highs-only stereo widen (optional, off by default)
-  6. transparent ceiling limiter: only touches peaks over 1.0,
-     memoryless tanh shoulder to 0.99 — no attack/release, no pumping
-
-Real-time safe: coefficients recomputed only on setter calls,
-filter state (zi) persists across blocks, audio thread never blocks.
-Overflow guard resets filter state instead of blowing up.
-"""
 import numpy as np
 from threading import Lock
 
