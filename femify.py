@@ -1,348 +1,695 @@
+import json
+import os
+import sys
+from pathlib import Path
+
 import numpy as np
-from threading import Lock
+import sounddevice as sd
 
-try:
-    from scipy.signal import sosfilt, sosfilt_zi, tf2sos
-    _HAS_SCIPY = True
-except Exception:
-    _HAS_SCIPY = False
-    sosfilt = None  # type: ignore
+from PySide6.QtCore import Qt, QTimer, Slot
+from PySide6.QtGui import QAction
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QGridLayout, QLabel, QSlider, QDoubleSpinBox, QGroupBox, QComboBox,
+    QPushButton, QCheckBox, QSystemTrayIcon, QMenu, QMessageBox,
+    QStatusBar, QButtonGroup, QStackedWidget, QDialog,
+)
 
-# Femtanyl-shifted 5-band layout: (label, freq, type, Q/S)
-# Lower sub (55 vs 60), tighter low-mid (180 vs 230), vocal at 900,
-# harshness notch zone at 3500, air at 15000.
-BANDS = [
-    ("Sub", 55, "lowshelf", 1.0),
-    ("Bass", 180, "peak", 1.1),
-    ("Vox", 900, "peak", 1.0),
-    ("Harsh", 3500, "peak", 1.2),
-    ("Air", 15000, "highshelf", 1.0),
-]
+from dsp_fem import (
+    AudioProcessor, BANDS, FEM_PRESETS, ADV_BANDS, ADV_PRESETS,
+    EQ_MAX_NORMAL, EQ_MAX_ADV,
+    find_device, list_wasapi_devices,
+    GAIN_MIN, GAIN_MAX, GAIN_DEFAULT,
+)
+from theme import apply_theme, make_icon, ACCENT
 
-# Presets tuned around: ALL THE TIME / KATAMARI / MAN BITES DOG (album) /
-# LOVESICK, CANNIBAL! — plus Flat. Order matches BANDS above.
-FEM_PRESETS = {
-    "Flat": [0.0, 0.0, 0.0, 0.0, 0.0],
-    "ALL THE TIME": [5.0, 2.0, 1.0, 0.0, 3.0],
-    "KATAMARI": [6.0, 3.0, -1.0, -1.0, 2.0],
-    "MAN BITES DOG": [4.0, 0.0, 2.0, -2.5, 3.5],
-    "LOVESICK, CANNIBAL!": [4.5, 1.0, 3.0, -1.0, 4.0],
-    "PUSH UR T3MPRR": [6.0, 2.5, 0.5, -0.5, 3.0],
-}
+SAMPLERATE = 48000
+CHANNELS = 2
+BLOCKSIZE = 1024
+HOSTAPI_NAME = "WASAPI"
 
-GAIN_MIN, GAIN_MAX = 1.50, 5.00
-GAIN_DEFAULT = 2.00
+DEFAULT_INPUT = "CABLE Output (VB-Audio Virtual Cable)"
+DEFAULT_OUTPUT = ""  # auto: first WASAPI output
+
+CONFIG_PATH = Path(os.environ.get("APPDATA", str(Path.home()))) / "Femify" / "settings.json"
+LEGACY_PATH = Path(os.environ.get("APPDATA", str(Path.home()))) / "SpotifyEnhancer" / "settings.json"
+
+HEARING_WARN_AT = 3.5
 
 
-def _biquad(f0, fs, db_gain, ftype, S_Q=1.0):
-    """RBJ cookbook biquad. Returns (b0,b1,b2,a1,a2) with a0=1."""
-    A = 10.0 ** (db_gain / 40.0)
-    w0 = 2.0 * np.pi * f0 / fs
-    cos_w0 = np.cos(w0)
-    sin_w0 = np.sin(w0)
-
-    if ftype == "peak":
-        Q = max(0.1, S_Q)
-        alpha = sin_w0 / (2.0 * Q)
-        b0 = 1.0 + alpha * A
-        b1 = -2.0 * cos_w0
-        b2 = 1.0 - alpha * A
-        a0 = 1.0 + alpha / A
-        a1 = -2.0 * cos_w0
-        a2 = 1.0 - alpha / A
-    elif ftype in ("lowshelf", "highshelf"):
-        S = max(0.1, S_Q)
-        alpha = sin_w0 / 2.0 * np.sqrt((A + 1.0 / A) * (1.0 / S - 1.0) + 2.0)
-        sqrtA = np.sqrt(A)
-        if ftype == "lowshelf":
-            b0 = A * ((A + 1.0) - (A - 1.0) * cos_w0 + 2.0 * sqrtA * alpha)
-            b1 = 2.0 * A * ((A - 1.0) - (A + 1.0) * cos_w0)
-            b2 = A * ((A + 1.0) - (A - 1.0) * cos_w0 - 2.0 * sqrtA * alpha)
-            a0 = (A + 1.0) + (A - 1.0) * cos_w0 + 2.0 * sqrtA * alpha
-            a1 = -2.0 * ((A - 1.0) + (A + 1.0) * cos_w0)
-            a2 = (A + 1.0) + (A - 1.0) * cos_w0 - 2.0 * sqrtA * alpha
-        else:
-            b0 = A * ((A + 1.0) + (A - 1.0) * cos_w0 + 2.0 * sqrtA * alpha)
-            b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cos_w0)
-            b2 = A * ((A + 1.0) + (A - 1.0) * cos_w0 - 2.0 * sqrtA * alpha)
-            a0 = (A + 1.0) - (A - 1.0) * cos_w0 + 2.0 * sqrtA * alpha
-            a1 = 2.0 * ((A - 1.0) - (A + 1.0) * cos_w0)
-            a2 = (A + 1.0) - (A - 1.0) * cos_w0 - 2.0 * sqrtA * alpha
-    elif ftype == "lowpass":
-        Q = max(0.1, S_Q)
-        alpha = sin_w0 / (2.0 * Q)
-        b0 = (1.0 - cos_w0) / 2.0
-        b1 = 1.0 - cos_w0
-        b2 = (1.0 - cos_w0) / 2.0
-        a0 = 1.0 + alpha
-        a1 = -2.0 * cos_w0
-        a2 = 1.0 - alpha
-    elif ftype == "highpass":
-        Q = max(0.1, S_Q)
-        alpha = sin_w0 / (2.0 * Q)
-        b0 = (1.0 + cos_w0) / 2.0
-        b1 = -(1.0 + cos_w0)
-        b2 = (1.0 + cos_w0) / 2.0
-        a0 = 1.0 + alpha
-        a1 = -2.0 * cos_w0
-        a2 = 1.0 - alpha
-    else:
-        raise ValueError(ftype)
-
-    return (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+def load_config():
+    cfg = {
+        "gain": GAIN_DEFAULT,
+        "eq": [0.0] * 5,
+        "adv_eq": [0.0] * 10,
+        "eq_mode": "normal",
+        "preset": "Flat",
+        "limiter": True,
+        "mono_bass": True,
+        "deharsh": True,
+        "widen": False,
+        "input_name": DEFAULT_INPUT,
+        "output_name": DEFAULT_OUTPUT,
+    }
+    # one-time migrate from Spotify Enhancer
+    try:
+        if not CONFIG_PATH.exists() and LEGACY_PATH.exists():
+            old = json.loads(LEGACY_PATH.read_text())
+            for k in ("gain", "eq", "preset", "limiter", "input_name", "output_name"):
+                if k in old:
+                    cfg[k] = old[k]
+    except Exception:
+        pass
+    try:
+        if CONFIG_PATH.exists():
+            cfg.update(json.loads(CONFIG_PATH.read_text()))
+    except Exception:
+        pass
+    try:
+        cfg["gain"] = min(GAIN_MAX, max(GAIN_MIN, float(cfg.get("gain", GAIN_DEFAULT))))
+    except Exception:
+        cfg["gain"] = GAIN_DEFAULT
+    eq = list(cfg.get("eq", [0.0] * 5))[:5]
+    while len(eq) < 5:
+        eq.append(0.0)
+    cfg["eq"] = [min(EQ_MAX_NORMAL, max(-EQ_MAX_NORMAL, float(x))) for x in eq]
+    adv = list(cfg.get("adv_eq", [0.0] * 10))[:10]
+    while len(adv) < 10:
+        adv.append(0.0)
+    cfg["adv_eq"] = [min(EQ_MAX_ADV, max(-EQ_MAX_ADV, float(x))) for x in adv]
+    if cfg.get("eq_mode") not in ("normal", "advanced"):
+        cfg["eq_mode"] = "normal"
+    return cfg
 
 
-def build_sos(eq_gains_db, samplerate, deharsh_on=True):
-    """Build unified SOS bank: [DC blocker, 5x EQ, optional de-harsh].
+class AdvWarningDialog(QDialog):
+    """Hearing-damage gate for advanced EQ. 5s countdown, Enter locked."""
 
-    Single pass = less CPU and no wandering between separate filter states.
-    """
-    sections = []
-    # 1. DC blocker first — stops stacked lowshelves + 808s drifting
-    sections.append(_biquad(10.0, samplerate, 0.0, "highpass", 0.707))
-    for (_, f0, ftype, sq), g in zip(BANDS, eq_gains_db):
-        sections.append(_biquad(f0, samplerate, float(g), ftype, sq))
-    if deharsh_on:
-        sections.append(_biquad(4000.0, samplerate, -3.0, "peak", 1.4))
-    sos = np.zeros((len(sections), 6), dtype=np.float64)
-    for i, (b0, b1, b2, a1, a2) in enumerate(sections):
-        sos[i] = (b0, b1, b2, 1.0, a1, a2)
-    return sos
+    def __init__(self, parent, gain, countdown_seconds=5):
+        super().__init__(parent)
+        self.setWindowTitle("ADVANCED EQ — WARNING")
+        self.setModal(True)
+        self._left = countdown_seconds
+        self.accepted_by_user = False
 
-
-def _single_sos(f0, fs, db_gain, ftype, sq=1.0):
-    b0, b1, b2, a1, a2 = _biquad(f0, fs, db_gain, ftype, sq)
-    return np.array([[b0, b1, b2, 1.0, a1, a2]], dtype=np.float64)
-
-
-def find_device(sd_module, name, kind, hostapi_name="WASAPI"):
-    """Exact match wins, else substring. Same behavior as original."""
-    channel_key = f"max_{kind}_channels"
-    wanted = name.casefold()
-    hostapis = sd_module.query_hostapis()
-    exact, partial, candidates = [], [], []
-    for index, dev in enumerate(sd_module.query_devices()):
-        if dev[channel_key] < 1:
-            continue
-        api_name = hostapis[dev["hostapi"]]["name"]
-        if hostapi_name.casefold() not in api_name.casefold():
-            continue
-        candidates.append(f"  [{index}] {dev['name']}")
-        dev_name = dev["name"].casefold()
-        if dev_name == wanted:
-            exact.append(index)
-        elif wanted in dev_name:
-            partial.append(index)
-    matches = exact or partial
-    if not matches:
-        raise RuntimeError(
-            f"No {hostapi_name} {kind} device found matching '{name}'.\n"
-            f"Available {kind} devices:\n" + "\n".join(candidates)
+        root = QVBoxLayout(self)
+        warn = QLabel(
+            "!! ADVANCED EQ CAN CAUSE ACTUAL HARM TO YOUR EARS !!\n\n"
+            f"10 bands up to ±32 dB, presets ×3"
+            f" — couple that with your current {gain:.1f}x gain"
+            + (" (2.5x+ DANGER ZONE)" if gain >= 2.5 else "")
+            + " and peaks sit permanently at the ceiling.\n\n"
+            "Start low, limiter recommended.\n"
+            "You enter at your own risk."
         )
-    return matches[0]
+        warn.setWordWrap(True)
+        warn.setStyleSheet("color: #ff2a5f; font-weight: 900;")
+        root.addWidget(warn)
+
+        self.count_label = QLabel()
+        self.count_label.setAlignment(Qt.AlignCenter)
+        root.addWidget(self.count_label)
+
+        row = QHBoxLayout()
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        self.enter_btn = QPushButton()
+        self.enter_btn.setEnabled(False)
+        self.enter_btn.clicked.connect(self._enter)
+        row.addWidget(cancel)
+        row.addWidget(self.enter_btn)
+        root.addLayout(row)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._tick)
+        self._tick()
+        self._timer.start()
+
+    def _tick(self):
+        if self._left > 0:
+            self.count_label.setText(f"Think about your ears… {self._left}s")
+            self.enter_btn.setText(f"Enter ({self._left})")
+            self._left -= 1
+        else:
+            self._timer.stop()
+            self.count_label.setText("You may enter.")
+            self.enter_btn.setText("I understand — Enter")
+            self.enter_btn.setEnabled(True)
+
+    def _enter(self):
+        self.accepted_by_user = True
+        self.accept()
 
 
-def list_wasapi_devices(sd_module, kind, hostapi_name="WASAPI"):
-    """Return [(index, name)] for the device picker combos."""
-    channel_key = f"max_{kind}_channels"
-    hostapis = sd_module.query_hostapis()
-    out = []
-    for index, dev in enumerate(sd_module.query_devices()):
-        if dev[channel_key] < 1:
-            continue
+def save_config(cfg):
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    except Exception:
+        pass
+
+
+class AudioEngine:
+    """Single input -> single output. No BT fan-out (unlike original)."""
+
+    def __init__(self, processor):
+        self.proc = processor
+        self.stream = None
+        self.running = False
+
+    def _audio_callback(self, indata, outdata, frames, time, status):
+        if status:
+            print(status, flush=True)
+        outdata[:] = self.proc.process(indata)
+
+    def start(self, in_idx, out_idx):
+        self.stop()
+        self.proc.reset()
+        self.stream = sd.Stream(
+            device=(in_idx, out_idx), samplerate=SAMPLERATE,
+            blocksize=BLOCKSIZE, channels=CHANNELS,
+            dtype="float32", callback=self._audio_callback,
+        )
+        self.stream.start()
+        self.running = True
+
+    def stop(self):
         try:
-            api_name = hostapis[dev["hostapi"]]["name"]
+            if self.stream is not None:
+                self.stream.stop()
+                self.stream.close()
         except Exception:
-            continue
-        if hostapi_name.casefold() not in api_name.casefold():
-            continue
-        out.append((index, dev["name"]))
-    return out
+            pass
+        self.stream = None
+        self.running = False
 
 
-class AudioProcessor:
-    """Gain + EQ + Femtanyl extras + transparent ceiling limiter."""
+class MainWindow(QMainWindow):
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        self.cfg = load_config()
+        self.adv_mode = self.cfg.get("eq_mode", "normal") == "advanced"
+        init_eq = self.cfg.get("adv_eq" if self.adv_mode else "eq")
+        self.proc = AudioProcessor(
+            samplerate=SAMPLERATE, channels=CHANNELS,
+            gain=self.cfg["gain"], eq_gains=init_eq,
+            limiter_enabled=self.cfg.get("limiter", True),
+            mono_bass=self.cfg.get("mono_bass", True),
+            deharsh=self.cfg.get("deharsh", True),
+            widen=self.cfg.get("widen", False),
+            advanced=self.adv_mode,
+        )
+        self.engine = AudioEngine(self.proc)
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(500)
+        self._save_timer.timeout.connect(self._save_now)
+        self._updating = False
 
-    # Transparent: only peaks OVER 1.0 get shaped, everything below passes
-    # untouched. Memoryless tanh shoulder — no attack/release, no pumping.
-    SOFT_KNEE = 1.00
-    SOFT_CEIL = 0.99
-    MONO_FREQ = 120.0
-    DEHARSH_FREQ = 4000.0
-    DEHARSH_DB = -3.0
-    WIDEN_AMOUNT = 0.30
+        self.setWindowTitle("Femify")
+        self.setWindowIcon(make_icon())
+        self.resize(620, 640)
 
-    def __init__(self, samplerate=48000, channels=2, gain=GAIN_DEFAULT,
-                 eq_gains=None, limiter_enabled=True,
-                 mono_bass=True, deharsh=True, widen=False):
-        self.samplerate = samplerate
-        self.channels = channels
-        self.lock = Lock()
-        self.gain = float(np.clip(gain, GAIN_MIN, GAIN_MAX))
-        self.eq_gains = list(eq_gains) if eq_gains else [0.0] * 5
-        self.limiter_enabled = bool(limiter_enabled)
-        self.mono_bass = bool(mono_bass)
-        self.deharsh = bool(deharsh)
-        self.widen = bool(widen)
-        self.sos = build_sos(self.eq_gains, samplerate, self.deharsh)
-        b0, b1, b2, a1, a2 = _biquad(self.MONO_FREQ, samplerate, 0.0,
-                                     "lowpass", 0.707)
-        self.mono_sos = np.array([[b0, b1, b2, 1.0, a1, a2]], dtype=np.float64)
-        self.zi = [np.zeros((self.sos.shape[0], 2), dtype=np.float64)
-                   for _ in range(channels)]
-        self.zi_mono = [np.zeros((1, 2), dtype=np.float64)
-                        for _ in range(channels)]
-        self._clip_flag = False
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
 
-    def _rebuild_bank(self):
-        new_sos = build_sos(self.eq_gains, self.samplerate, self.deharsh)
-        if new_sos.shape[0] != self.sos.shape[0]:
-            self.zi = [np.zeros((new_sos.shape[0], 2), dtype=np.float64)
-                       for _ in range(self.channels)]
-        self.sos = new_sos
+        # ---- header ----
+        title = QLabel("FEMIFY")
+        title.setObjectName("femTitle")
+        title.setAlignment(Qt.AlignCenter)
+        root.addWidget(title)
+        sub = QLabel("FEMTANYL MODE // 1.5x-5.0x MAXIMUM HEARING")
+        sub.setObjectName("femSub")
+        sub.setAlignment(Qt.AlignCenter)
+        root.addWidget(sub)
 
-    # ---- UI thread setters ----
-    def set_gain(self, g):
-        g = float(np.clip(g, GAIN_MIN, GAIN_MAX))
-        with self.lock:
-            self.gain = g
+        # ---- Gain ----
+        gain_box = QGroupBox("GAIN (maximum hearing)")
+        gl = QHBoxLayout(gain_box)
+        self.gain_slider = QSlider(Qt.Horizontal)
+        self.gain_slider.setRange(int(GAIN_MIN * 100), int(GAIN_MAX * 100))
+        self.gain_slider.setValue(int(self.proc.gain * 100))
+        self.gain_slider.setTickPosition(QSlider.TicksBelow)
+        self.gain_slider.setTickInterval(50)
+        self.gain_spin = QDoubleSpinBox()
+        self.gain_spin.setRange(GAIN_MIN, GAIN_MAX)
+        self.gain_spin.setSingleStep(0.10)
+        self.gain_spin.setValue(self.proc.gain)
+        self.gain_spin.setSuffix("x")
+        self.gain_slider.valueChanged.connect(self._on_gain_slider)
+        self.gain_spin.valueChanged.connect(self._on_gain_spin)
+        gl.addWidget(QLabel("Volume"))
+        gl.addWidget(self.gain_slider, 1)
+        gl.addWidget(self.gain_spin)
+        root.addWidget(gain_box)
+        self.hearing_label = QLabel("")
+        self.hearing_label.setAlignment(Qt.AlignCenter)
+        root.addWidget(self.hearing_label)
+        self._update_hearing_warning(self.proc.gain)
 
-    def set_eq(self, gains):
-        gains = [float(x) for x in gains]
-        with self.lock:
-            self.eq_gains = gains
-            self._rebuild_bank()
+        # ---- EQ (normal 5-band / advanced 10-band pages) ----
+        self.eq_box = QGroupBox("EQUALIZER (±12 dB)")
+        eq_root = QVBoxLayout(self.eq_box)
+        self.eq_stack = QStackedWidget()
+        eq_root.addWidget(self.eq_stack)
+        self.eq_pages = {}  # adv_flag -> {"sliders": [], "labels": []}
+        self.eq_stack.addWidget(self._build_eq_page(BANDS, EQ_MAX_NORMAL, False))
+        self.eq_stack.addWidget(self._build_eq_page(ADV_BANDS, EQ_MAX_ADV, True))
+        # restore saved values into both pages
+        self._set_page_values(False, self.cfg.get("eq", [0.0] * 5))
+        self._set_page_values(True, self.cfg.get("adv_eq", [0.0] * 10))
+        self.eq_stack.setCurrentIndex(1 if self.adv_mode else 0)
+        self._refresh_eq_title()
+        root.addWidget(self.eq_box)
 
-    def set_limiter_enabled(self, on):
-        with self.lock:
-            self.limiter_enabled = bool(on)
+        # ---- Preset buttons ----
+        preset_box = QGroupBox("FEM PRESETS")
+        pv = QVBoxLayout(preset_box)
+        self.preset_group = QButtonGroup(self)
+        self.preset_group.setExclusive(True)
+        self.preset_buttons = {}
+        row = QHBoxLayout()
+        for j, name in enumerate(FEM_PRESETS.keys()):
+            b = QPushButton(name)
+            b.setObjectName("presetBtn")
+            b.setCheckable(True)
+            b.clicked.connect(lambda _c, n=name: self._apply_preset(n))
+            row.addWidget(b)
+            self.preset_group.addButton(b)
+            self.preset_buttons[name] = b
+            if j == 2:  # wrap to 2 rows of 3
+                pv.addLayout(row)
+                row = QHBoxLayout()
+        pv.addLayout(row)
+        adv_row = QHBoxLayout()
+        adv_row.addWidget(QLabel("EQ mode:"))
+        self.adv_btn = QPushButton("NORMAL EQ")
+        self.adv_btn.setObjectName("presetBtn")
+        self.adv_btn.setCheckable(True)
+        self.adv_btn.setChecked(self.adv_mode)
+        self.adv_btn.toggled.connect(self._on_adv_toggle)
+        adv_row.addWidget(self.adv_btn, 1)
+        self.adv_banner = QLabel("ADVANCED ±32dB ACTIVE — WATCH YOUR EARS")
+        self.adv_banner.setAlignment(Qt.AlignCenter)
+        self.adv_banner.setStyleSheet("color: #ff2222; font-weight: 900;")
+        self.adv_banner.setVisible(self.adv_mode)
+        adv_row.addWidget(self.adv_banner, 2)
+        pv.addLayout(adv_row)
+        if self.adv_mode:
+            self.adv_btn.setText("ADVANCED EQ")
+        custom_row = QHBoxLayout()
+        custom_row.addWidget(QLabel("Preset:"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItems(list(FEM_PRESETS.keys()) + ["Custom"])
+        self.preset_combo.setCurrentText(self.cfg.get("preset", "Flat"))
+        self.preset_combo.currentTextChanged.connect(self._on_preset)
+        custom_row.addWidget(self.preset_combo, 1)
+        self.limiter_check = QCheckBox("Soft limiter")
+        self.limiter_check.setChecked(self.proc.limiter_enabled)
+        self.limiter_check.toggled.connect(self._on_limiter)
+        custom_row.addWidget(self.limiter_check)
+        self.clip_label = QLabel("● OK")
+        self.clip_label.setStyleSheet("color: #39ff6a; font-weight: bold;")
+        custom_row.addWidget(self.clip_label)
+        pv.addLayout(custom_row)
+        root.addWidget(preset_box)
+        self._resync_preset_ui()
 
-    def set_mono_bass(self, on):
-        with self.lock:
-            self.mono_bass = bool(on)
+        # ---- Extras ----
+        extra_box = QGroupBox("FEM FLAVOR")
+        el = QHBoxLayout(extra_box)
+        self.mono_check = QCheckBox("Mono bass <120Hz")
+        self.mono_check.setChecked(self.proc.mono_bass)
+        self.mono_check.toggled.connect(lambda on: (self.proc.set_mono_bass(on), self.schedule_save()))
+        self.deharsh_check = QCheckBox("De-harsh 4k")
+        self.deharsh_check.setChecked(self.proc.deharsh)
+        self.deharsh_check.toggled.connect(lambda on: (self.proc.set_deharsh(on), self.schedule_save()))
+        self.widen_check = QCheckBox("Widen highs +30%")
+        self.widen_check.setChecked(self.proc.widen)
+        self.widen_check.toggled.connect(lambda on: (self.proc.set_widen(on), self.schedule_save()))
+        el.addWidget(self.mono_check)
+        el.addWidget(self.deharsh_check)
+        el.addWidget(self.widen_check)
+        root.addWidget(extra_box)
 
-    def set_deharsh(self, on):
-        with self.lock:
-            on = bool(on)
-            if on != self.deharsh:
-                self.deharsh = on
-                self._rebuild_bank()
+        # ---- Devices (single output) ----
+        dev_box = QGroupBox("DEVICES (WASAPI)")
+        dl = QVBoxLayout(dev_box)
+        self.in_combo = QComboBox()
+        self.out_combo = QComboBox()
+        for text, combo in (("Capture from:", self.in_combo), ("Play to:", self.out_combo)):
+            r = QHBoxLayout()
+            r.addWidget(QLabel(text), 0)
+            r.addWidget(combo, 1)
+            dl.addLayout(r)
+        btn_row = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh list")
+        refresh_btn.clicked.connect(self._refresh_devices)
+        self.restart_btn = QPushButton("Restart audio")
+        self.restart_btn.clicked.connect(self._restart_audio)
+        btn_row.addWidget(refresh_btn)
+        btn_row.addWidget(self.restart_btn)
+        dl.addLayout(btn_row)
+        root.addWidget(dev_box)
 
-    def set_widen(self, on):
-        with self.lock:
-            self.widen = bool(on)
+        self.status = QStatusBar()
+        self.setStatusBar(self.status)
 
-    def get_state(self):
-        with self.lock:
-            return (self.gain, list(self.eq_gains), self.limiter_enabled,
-                    self.mono_bass, self.deharsh, self.widen)
+        # ---- Tray ----
+        self.tray = QSystemTrayIcon(make_icon(), self)
+        self.tray.setToolTip("Femify")
+        menu = QMenu()
+        show_act = QAction("Show", self)
+        show_act.triggered.connect(self.showNormal_raise)
+        exit_act = QAction("Exit", self)
+        exit_act.triggered.connect(self._exit)
+        menu.addAction(show_act)
+        menu.addAction(exit_act)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray)
+        self.tray.show()
 
-    def reset(self):
-        with self.lock:
-            self.zi = [np.zeros((self.sos.shape[0], 2), dtype=np.float64)
-                       for _ in range(self.channels)]
-            self.zi_mono = [np.zeros((1, 2), dtype=np.float64)
-                            for _ in range(self.channels)]
-            self._clip_flag = False
+        self._clip_timer = QTimer(self)
+        self._clip_timer.setInterval(150)
+        self._clip_timer.timeout.connect(self._poll_clip)
+        self._clip_timer.start()
 
-    def poll_clip(self):
-        with self.lock:
-            v = self._clip_flag
-            self._clip_flag = False
-            return v
+        self._refresh_devices(select_saved=True)
+        self._restart_audio(silent=False)
 
-    def _apply_sos_bank(self, audio, sos, zi_list):
-        if _HAS_SCIPY:
-            for ch in range(min(self.channels, audio.shape[1])):
-                y, zf = sosfilt(sos, audio[:, ch], zi=zi_list[ch])
-                audio[:, ch] = y
-                zi_list[ch] = zf
+    # ---------- EQ pages ----------
+    def _active_tables(self):
+        if self.adv_mode:
+            return ADV_BANDS, ADV_PRESETS, EQ_MAX_ADV
+        return BANDS, FEM_PRESETS, EQ_MAX_NORMAL
+
+    def _build_eq_page(self, bands, eq_max, adv_flag):
+        page = QWidget()
+        grid = QGridLayout(page)
+        grid.setSpacing(4)
+        sliders, labels = [], []
+        rng = int(eq_max * 10)
+        per_row = 5
+        for i, (label, freq, _, _) in enumerate(bands):
+            col = QVBoxLayout()
+            slider = QSlider(Qt.Vertical)
+            slider.setRange(-rng, rng)
+            slider.setValue(0)
+            slider.setTickPosition(QSlider.TicksRight)
+            slider.setTickInterval(rng // 2)
+            slider.valueChanged.connect(lambda v, idx=i: self._on_eq(idx, v / 10.0))
+            val = QLabel("+0.0 dB")
+            val.setAlignment(Qt.AlignCenter)
+            col.addWidget(slider, 1, alignment=Qt.AlignHCenter)
+            col.addWidget(val)
+            freq_txt = f"{freq}" if freq < 1000 else f"{freq/1000:g}k"
+            name = QLabel(f"{label}\n{freq_txt}")
+            name.setAlignment(Qt.AlignCenter)
+            col.addWidget(name)
+            grid.addLayout(col, i // per_row, i % per_row)
+            sliders.append(slider)
+            labels.append(val)
+        self.eq_pages[adv_flag] = {"sliders": sliders, "labels": labels}
+        return page
+
+    def _set_page_values(self, adv_flag, values):
+        info = self.eq_pages[adv_flag]
+        for s, lab, v in zip(info["sliders"], info["labels"], values):
+            s.blockSignals(True)
+            s.setValue(int(v * 10))
+            s.blockSignals(False)
+            lab.setText(f"{v:+.1f} dB")
+
+    def _page_values(self, adv_flag):
+        return [s.value() / 10.0 for s in self.eq_pages[adv_flag]["sliders"]]
+
+    def _refresh_eq_title(self):
+        if self.adv_mode:
+            self.eq_box.setTitle("ADVANCED EQUALIZER (±32 dB — DANGER)")
         else:
-            for ch in range(min(self.channels, audio.shape[1])):
-                x = audio[:, ch]
-                for (b0, b1, b2, _, a1, a2) in sos:
-                    y = np.empty_like(x)
-                    x1 = x2 = y1 = y2 = 0.0
-                    for n in range(len(x)):
-                        x0 = x[n]
-                        y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
-                        y[n] = y0
-                        x2, x1, y2, y1 = x1, x0, y1, y0
-                    x = y
-                audio[:, ch] = x
-        return audio
+            self.eq_box.setTitle("EQUALIZER (±12 dB)")
 
-    # ---- audio thread ----
-    def process(self, indata):
-        with self.lock:
-            gain = self.gain
-            sos = self.sos.copy()
-            limiter_on = self.limiter_enabled
-            mono_on = self.mono_bass
-            widen_on = self.widen
+    # ---------- UI slots ----------
+    @Slot(int)
+    def _on_gain_slider(self, v):
+        if self._updating:
+            return
+        self._updating = True
+        self.gain_spin.setValue(v / 100.0)
+        self._updating = False
+        self.proc.set_gain(v / 100.0)
+        self._update_hearing_warning(v / 100.0)
+        self.schedule_save()
 
-        audio = np.asarray(indata, dtype=np.float32) * gain
+    @Slot(float)
+    def _on_gain_spin(self, v):
+        if self._updating:
+            return
+        self._updating = True
+        self.gain_slider.setValue(int(round(v * 100)))
+        self._updating = False
+        self.proc.set_gain(v)
+        self._update_hearing_warning(v)
+        self.schedule_save()
 
-        # Single unified pass: DC blocker + EQ + de-harsh. Skip only when
-        # everything is flat AND de-harsh off (DC blocker still runs).
-        audio = audio.astype(np.float64, copy=True)
-        audio = self._apply_sos_bank(audio, sos, self.zi)
-        audio = audio.astype(np.float32, copy=False)
-
-        # Overflow guard: hot IIR states can blow up at 5x + stacked bass.
-        # Reset instead of letting levels wander (the "dipping" sound).
-        if not np.all(np.isfinite(audio)):
-            self.reset()
-            return np.zeros_like(audio, dtype=np.float32)
-
-        if (mono_on or widen_on) and audio.shape[1] >= 2:
-            tmp = audio.astype(np.float64, copy=False)
-            lows = np.empty_like(tmp)
-            if _HAS_SCIPY:
-                for ch in range(2):
-                    y, zf = sosfilt(self.mono_sos, tmp[:, ch],
-                                    zi=self.zi_mono[ch])
-                    lows[:, ch] = y
-                    self.zi_mono[ch] = zf
-            else:
-                lows[:] = tmp * 0.2
-            if not np.all(np.isfinite(lows)):
-                self.reset()
-                return np.zeros_like(audio, dtype=np.float32)
-            highs = tmp - lows
-            if mono_on:
-                mono_low = (lows[:, 0] + lows[:, 1]) * 0.5
-                lows[:, 0] = mono_low
-                lows[:, 1] = mono_low
-            if widen_on:
-                mid = (highs[:, 0] + highs[:, 1]) * 0.5
-                side0 = highs[:, 0] - mid
-                side1 = highs[:, 1] - mid
-                k = 1.0 + self.WIDEN_AMOUNT
-                highs[:, 0] = mid + side0 * k
-                highs[:, 1] = mid + side1 * k
-            audio = (lows + highs).astype(np.float32, copy=False)
-
-        # Transparent ceiling limiter: peaks <= 1.0 pass bit-clean (other
-        # than EQ), only overs get a tanh shoulder to 0.99. No time
-        # constants, so loud sections keep RMS instead of ducking.
-        pre_peak = float(np.max(np.abs(audio))) if audio.size else 0.0
-        if limiter_on:
-            knee, ceil = self.SOFT_KNEE, self.SOFT_CEIL
-            if pre_peak > knee:
-                mag = np.abs(audio)
-                over = mag > knee
-                if np.any(over):
-                    span = ceil - knee
-                    shaped = knee + span * np.tanh((mag[over] - knee) / span)
-                    audio[over] = np.sign(audio[over]) * shaped
-                    audio = audio.astype(np.float32, copy=False)
-                with self.lock:
-                    self._clip_flag = True
+    def _update_hearing_warning(self, g):
+        if self.adv_mode:
+            self.hearing_label.setText(f"!! ADVANCED EQ ±32dB @ {g:.1f}x — EAR DAMAGE CERTAIN IF LOUD !!")
+            self.hearing_label.setStyleSheet(f"color: {ACCENT}; font-weight: 900;")
+        elif g >= HEARING_WARN_AT:
+            self.hearing_label.setText(f"!! {g:.1f}x HEARING DAMAGE RANGE !!")
+            self.hearing_label.setStyleSheet(f"color: {ACCENT}; font-weight: 900;")
+        elif g >= 2.5:
+            self.hearing_label.setText(f"{g:.1f}x loud — limiter recommended")
+            self.hearing_label.setStyleSheet("color: #ffcc00; font-weight: bold;")
         else:
-            if pre_peak >= 0.999:
-                with self.lock:
-                    self._clip_flag = True
+            self.hearing_label.setText("")
+            self.hearing_label.setStyleSheet("")
 
-        np.clip(audio, -0.999, 0.999, out=audio)
-        return audio
+    def _on_eq(self, idx, db):
+        info = self.eq_pages[self.adv_mode]
+        info["labels"][idx].setText(f"{db:+.1f} dB")
+        eq = self._page_values(self.adv_mode)
+        self.proc.set_eq(eq)
+        _, presets, _ = self._active_tables()
+        for name, vals in presets.items():
+            if all(abs(a - b) < 0.05 for a, b in zip(eq, vals)):
+                self.preset_combo.blockSignals(True)
+                self.preset_combo.setCurrentText(name)
+                self.preset_combo.blockSignals(False)
+                self._sync_preset_buttons(name)
+                break
+        else:
+            self.preset_combo.blockSignals(True)
+            self.preset_combo.setCurrentText("Custom")
+            self.preset_combo.blockSignals(False)
+            self._sync_preset_buttons("Custom")
+        self.schedule_save()
+
+    def _sync_preset_buttons(self, name):
+        for n, b in self.preset_buttons.items():
+            b.blockSignals(True)
+            b.setChecked(n == name)
+            b.blockSignals(False)
+
+    def _apply_preset(self, name):
+        _, presets, _ = self._active_tables()
+        vals = presets[name]
+        self.proc.set_eq(vals)
+        self._set_page_values(self.adv_mode, vals)
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.setCurrentText(name)
+        self.preset_combo.blockSignals(False)
+        self._sync_preset_buttons(name)
+        self.schedule_save()
+
+    def _on_preset(self, name):
+        _, presets, _ = self._active_tables()
+        if name in presets:
+            self._apply_preset(name)
+        self.schedule_save()
+
+    def _on_adv_toggle(self, checked):
+        if checked == self.adv_mode:
+            return
+        if checked:
+            # gate every entry behind the 5s warning
+            gain = self.proc.gain
+            dlg = AdvWarningDialog(self, gain)
+            if dlg.exec() != QDialog.Accepted or not dlg.accepted_by_user:
+                self.adv_btn.blockSignals(True)
+                self.adv_btn.setChecked(False)
+                self.adv_btn.blockSignals(False)
+                return
+            self._enter_advanced()
+        else:
+            self._exit_advanced()
+
+    def _enter_advanced(self):
+        # stash normal values, switch DSP + page, load advanced values
+        self.cfg["eq"] = self._page_values(False)
+        self.adv_mode = True
+        self.proc.set_eq_mode(True)
+        self.proc.set_eq(self._page_values(True))
+        self.eq_stack.setCurrentIndex(1)
+        self.adv_btn.setText("ADVANCED EQ")
+        self.adv_banner.setVisible(True)
+        self._refresh_eq_title()
+        self._resync_preset_ui()
+        self._update_hearing_warning(self.proc.gain)
+        self.schedule_save()
+
+    def _exit_advanced(self):
+        self.cfg["adv_eq"] = self._page_values(True)
+        self.adv_mode = False
+        self.proc.set_eq_mode(False)
+        self.proc.set_eq(self._page_values(False))
+        self.eq_stack.setCurrentIndex(0)
+        self.adv_btn.setText("NORMAL EQ")
+        self.adv_banner.setVisible(False)
+        self._refresh_eq_title()
+        self._resync_preset_ui()
+        self._update_hearing_warning(self.proc.gain)
+        self.schedule_save()
+
+    def _resync_preset_ui(self):
+        _, presets, _ = self._active_tables()
+        eq = self._page_values(self.adv_mode)
+        for name, vals in presets.items():
+            if all(abs(a - b) < 0.05 for a, b in zip(eq, vals)):
+                self.preset_combo.blockSignals(True)
+                self.preset_combo.setCurrentText(name)
+                self.preset_combo.blockSignals(False)
+                self._sync_preset_buttons(name)
+                return
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.setCurrentText("Custom")
+        self.preset_combo.blockSignals(False)
+        self._sync_preset_buttons("Custom")
+
+    def _on_limiter(self, on):
+        # never forced — user choice even at 5x
+        self.proc.set_limiter_enabled(on)
+        self.schedule_save()
+
+    # ---------- devices / engine ----------
+    def _refresh_devices(self, select_saved=False):
+        try:
+            ins = list_wasapi_devices(sd, "input", HOSTAPI_NAME)
+            outs = list_wasapi_devices(sd, "output", HOSTAPI_NAME)
+        except Exception as e:
+            self.status.showMessage(f"Device query failed: {e}")
+            return
+        for combo, devs in ((self.in_combo, ins), (self.out_combo, outs)):
+            combo.blockSignals(True)
+            combo.clear()
+            for idx, name in devs:
+                combo.addItem(f"[{idx}] {name}", userData=name)
+            combo.blockSignals(False)
+        if select_saved:
+            self._select_by_name(self.in_combo, self.cfg.get("input_name", ""))
+            saved_out = self.cfg.get("output_name", "")
+            if saved_out:
+                self._select_by_name(self.out_combo, saved_out)
+            # else: leave at first output (auto)
+
+    def _select_by_name(self, combo, name):
+        if not name:
+            return
+        for i in range(combo.count()):
+            if combo.itemData(i) == name or name.casefold() in combo.itemText(i).casefold():
+                combo.setCurrentIndex(i)
+                return
+
+    def _restart_audio(self, silent=True):
+        in_name = self.in_combo.currentData() or self.cfg.get("input_name", DEFAULT_INPUT)
+        out_name = self.out_combo.currentData() or self.cfg.get("output_name", "")
+        try:
+            in_idx = find_device(sd, in_name, "input", HOSTAPI_NAME)
+            if not out_name:
+                # auto-pick current combo selection
+                out_name = self.out_combo.currentData() or ""
+                if not out_name:
+                    raise RuntimeError("No output device available.")
+            out_idx = find_device(sd, out_name, "output", HOSTAPI_NAME)
+            self.engine.start(in_idx, out_idx)
+            self.status.showMessage(f"Running: {in_name} → {out_name} @ {self.proc.gain:.1f}x")
+            self.cfg.update({"input_name": in_name, "output_name": out_name})
+            self.schedule_save()
+        except Exception as e:
+            self.engine.stop()
+            self.status.showMessage("Audio stopped — check devices")
+            if not silent:
+                QMessageBox.warning(self, "Femify audio error",
+                                    f"Could not start audio.\n\n{e}\n\nPick devices and press Restart audio.")
+
+    # ---------- persistence ----------
+    def schedule_save(self):
+        self._save_timer.start()
+
+    def _save_now(self):
+        gain, eq, lim, mono, deh, wid, adv = self.proc.get_state()
+        # stash the visible page's live values into the right key
+        if adv:
+            self.cfg["adv_eq"] = self._page_values(True)
+        else:
+            self.cfg["eq"] = self._page_values(False)
+        self.cfg.update({
+            "gain": gain, "limiter": lim,
+            "mono_bass": mono, "deharsh": deh, "widen": wid,
+            "eq_mode": "advanced" if adv else "normal",
+            "preset": self.preset_combo.currentText(),
+            "input_name": self.in_combo.currentData() or self.cfg.get("input_name", ""),
+            "output_name": self.out_combo.currentData() or self.cfg.get("output_name", ""),
+        })
+        save_config(self.cfg)
+
+    # ---------- tray / window ----------
+    def _on_tray(self, reason):
+        if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
+            self.showNormal_raise()
+
+    def showNormal_raise(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.hide()
+        self.tray.showMessage("Femify", "Still running in the tray. Right-click → Exit to quit.")
+
+    def _poll_clip(self):
+        if self.proc.poll_clip():
+            self.clip_label.setText("● HOT")
+            self.clip_label.setStyleSheet("color: #ff2222; font-weight: bold;")
+            QTimer.singleShot(600, self._clip_ok)
+
+    @Slot()
+    def _clip_ok(self):
+        self.clip_label.setText("● OK")
+        self.clip_label.setStyleSheet("color: #39ff6a; font-weight: bold;")
+
+    def _exit(self):
+        self._save_now()
+        self.engine.stop()
+        self.tray.hide()
+        self.app.quit()
+
+
+def main():
+    app = QApplication(sys.argv)
+    apply_theme(app)
+    app.setQuitOnLastWindowClosed(False)
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        QMessageBox.warning(None, "Femify", "System tray not available — window will stay open.")
+    win = MainWindow(app)
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
