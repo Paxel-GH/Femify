@@ -30,6 +30,41 @@ FEM_PRESETS = {
     "PUSH UR T3MPRR": [6.0, 2.5, 0.5, -0.5, 3.0],
 }
 
+# Advanced 10-band layout: each normal band maps to its 2 nearest
+# advanced bands (pairs below), values x3. Wider coverage + finer control.
+ADV_BANDS = [
+    ("Sub-", 31, "lowshelf", 1.0),
+    ("Sub+", 62, "peak", 1.1),
+    ("Low", 125, "peak", 1.1),
+    ("LowMid", 250, "peak", 1.1),
+    ("Mid-", 500, "peak", 1.0),
+    ("Mid+", 1000, "peak", 1.0),
+    ("HiMid-", 2000, "peak", 1.1),
+    ("HiMid+", 4000, "peak", 1.2),
+    ("Presence", 8000, "peak", 1.1),
+    ("Air", 16000, "highshelf", 1.0),
+]
+
+# normal-band index -> (advanced-band pair)
+ADV_MAP = {0: (0, 1), 1: (2, 3), 2: (4, 5), 3: (6, 7), 4: (8, 9)}
+
+EQ_MAX_NORMAL = 12.0
+EQ_MAX_ADV = 32.0
+
+
+def _scale_presets_adv():
+    out = {}
+    for name, vals in FEM_PRESETS.items():
+        adv = [0.0] * len(ADV_BANDS)
+        for ni, v in enumerate(vals):
+            for ai in ADV_MAP[ni]:
+                adv[ai] = min(EQ_MAX_ADV, max(-EQ_MAX_ADV, float(v) * 3.0))
+        out[name] = adv
+    return out
+
+
+ADV_PRESETS = _scale_presets_adv()
+
 GAIN_MIN, GAIN_MAX = 1.50, 5.00
 GAIN_DEFAULT = 2.00
 
@@ -92,15 +127,18 @@ def _biquad(f0, fs, db_gain, ftype, S_Q=1.0):
     return (b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
 
 
-def build_sos(eq_gains_db, samplerate, deharsh_on=True):
-    """Build unified SOS bank: [DC blocker, 5x EQ, optional de-harsh].
+def build_sos(eq_gains_db, samplerate, deharsh_on=True, bands=None):
+    """Build unified SOS bank: [DC blocker, Nx EQ, optional de-harsh].
 
     Single pass = less CPU and no wandering between separate filter states.
+    bands defaults to the normal 5-band layout; advanced passes ADV_BANDS.
     """
+    if bands is None:
+        bands = BANDS
     sections = []
     # 1. DC blocker first — stops stacked lowshelves + 808s drifting
     sections.append(_biquad(10.0, samplerate, 0.0, "highpass", 0.707))
-    for (_, f0, ftype, sq), g in zip(BANDS, eq_gains_db):
+    for (_, f0, ftype, sq), g in zip(bands, eq_gains_db):
         sections.append(_biquad(f0, samplerate, float(g), ftype, sq))
     if deharsh_on:
         sections.append(_biquad(4000.0, samplerate, -3.0, "peak", 1.4))
@@ -161,11 +199,13 @@ def list_wasapi_devices(sd_module, kind, hostapi_name="WASAPI"):
 
 
 class AudioProcessor:
-    """Gain + EQ + Femtanyl extras + transparent ceiling limiter."""
+    """Gain + EQ + Femtanyl extras + musical ceiling limiter."""
 
-    # Transparent: only peaks OVER 1.0 get shaped, everything below passes
-    # untouched. Memoryless tanh shoulder — no attack/release, no pumping.
-    SOFT_KNEE = 1.00
+    # Musical, not flat: knee well below 0dB with a WIDE tanh shoulder so
+    # loud passages get progressively rounded (soft saturation harmonics)
+    # instead of flat-topped. span MUST stay positive (knee < ceil) —
+    # knee >= ceil degenerates into a brickwall hard clipper.
+    SOFT_KNEE = 0.80
     SOFT_CEIL = 0.99
     MONO_FREQ = 120.0
     DEHARSH_FREQ = 4000.0
@@ -174,17 +214,20 @@ class AudioProcessor:
 
     def __init__(self, samplerate=48000, channels=2, gain=GAIN_DEFAULT,
                  eq_gains=None, limiter_enabled=True,
-                 mono_bass=True, deharsh=True, widen=False):
+                 mono_bass=True, deharsh=True, widen=False,
+                 advanced=False):
         self.samplerate = samplerate
         self.channels = channels
         self.lock = Lock()
         self.gain = float(np.clip(gain, GAIN_MIN, GAIN_MAX))
-        self.eq_gains = list(eq_gains) if eq_gains else [0.0] * 5
+        self.advanced = bool(advanced)
+        self.eq_gains = list(eq_gains) if eq_gains else [0.0] * self.n_bands
         self.limiter_enabled = bool(limiter_enabled)
         self.mono_bass = bool(mono_bass)
         self.deharsh = bool(deharsh)
         self.widen = bool(widen)
-        self.sos = build_sos(self.eq_gains, samplerate, self.deharsh)
+        self.sos = build_sos(self.eq_gains, samplerate, self.deharsh,
+                             self.active_bands)
         b0, b1, b2, a1, a2 = _biquad(self.MONO_FREQ, samplerate, 0.0,
                                      "lowpass", 0.707)
         self.mono_sos = np.array([[b0, b1, b2, 1.0, a1, a2]], dtype=np.float64)
@@ -194,8 +237,21 @@ class AudioProcessor:
                         for _ in range(channels)]
         self._clip_flag = False
 
+    @property
+    def active_bands(self):
+        return ADV_BANDS if self.advanced else BANDS
+
+    @property
+    def n_bands(self):
+        return len(self.active_bands)
+
+    @property
+    def eq_max(self):
+        return EQ_MAX_ADV if self.advanced else EQ_MAX_NORMAL
+
     def _rebuild_bank(self):
-        new_sos = build_sos(self.eq_gains, self.samplerate, self.deharsh)
+        new_sos = build_sos(self.eq_gains, self.samplerate, self.deharsh,
+                            self.active_bands)
         if new_sos.shape[0] != self.sos.shape[0]:
             self.zi = [np.zeros((new_sos.shape[0], 2), dtype=np.float64)
                        for _ in range(self.channels)]
@@ -208,10 +264,23 @@ class AudioProcessor:
             self.gain = g
 
     def set_eq(self, gains):
-        gains = [float(x) for x in gains]
+        lim = self.eq_max
+        gains = [float(min(lim, max(-lim, x))) for x in gains]
         with self.lock:
             self.eq_gains = gains
             self._rebuild_bank()
+
+    def set_eq_mode(self, advanced):
+        """Switch normal 5-band <-> advanced 10-band. Caller must set_eq
+        with the other mode's values right after (lengths differ)."""
+        with self.lock:
+            advanced = bool(advanced)
+            if advanced != self.advanced:
+                self.advanced = advanced
+                n = len(ADV_BANDS if advanced else BANDS)
+                self.eq_gains = (list(self.eq_gains)[:n] +
+                                 [0.0] * max(0, n - len(self.eq_gains)))
+                self._rebuild_bank()
 
     def set_limiter_enabled(self, on):
         with self.lock:
@@ -235,7 +304,7 @@ class AudioProcessor:
     def get_state(self):
         with self.lock:
             return (self.gain, list(self.eq_gains), self.limiter_enabled,
-                    self.mono_bass, self.deharsh, self.widen)
+                    self.mono_bass, self.deharsh, self.widen, self.advanced)
 
     def reset(self):
         with self.lock:
@@ -323,9 +392,10 @@ class AudioProcessor:
                 highs[:, 1] = mid + side1 * k
             audio = (lows + highs).astype(np.float32, copy=False)
 
-        # Transparent ceiling limiter: peaks <= 1.0 pass bit-clean (other
-        # than EQ), only overs get a tanh shoulder to 0.99. No time
-        # constants, so loud sections keep RMS instead of ducking.
+        # Musical ceiling limiter: knee 0.80 with a wide 0.19 tanh shoulder.
+        # Below-knee transients pass bit-clean (punch kept); overs get
+        # progressively rounded instead of flat-topped. Memoryless, so
+        # loud sections keep their RMS instead of ducking.
         pre_peak = float(np.max(np.abs(audio))) if audio.size else 0.0
         if limiter_on:
             knee, ceil = self.SOFT_KNEE, self.SOFT_CEIL
