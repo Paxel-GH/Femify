@@ -13,6 +13,7 @@ Features:<br>
 |Soft limiter<br>
 |Fem Flavor<br>
 |Unique UI<br>
+|Advanced EQ<br>
 <br>
 Requirements:<br>
 |VB Audio Virtual Cable<br>
