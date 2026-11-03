@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>About — Femify</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="index.html"><span class="dot"></span>Femify</a>
+      <button class="menu-btn" aria-label="Menu">☰</button>
+      <div class="nav-links">
+        <a href="index.html">Home</a>
+        <a href="about.html">About</a>
+        <a href="roadmap.html">Roadmap</a>
+        <a href="terms.html">Terms</a>
+        <a class="nav-cta" href="https://github.com/Paxel-GH/Femify" target="_blank" rel="noopener">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <section>
+      <div class="container">
+        <h1>About</h1>
+        <p class="section-sub">Lore, origin, and the people behind it.</p>
+
+        <div class="prose">
+          <!-- STARTER TEXT -->
+          <h2>What is Femify?</h2>
+          <p>
+            Femify is a fresh rewrite of an older Spotify enhancer, retuned specifically for femtanyl:
+            <em>ALL THE TIME / KATAMARI / MAN BITES DOG (album) / LOVESICK, CANNIBAL! / PUSH UR T3MPRR</em>.
+            Where the original was general-purpose, Femify leans into distorted 808s, fast breaks,
+            pitched-up vocals, and already-hot masters.
+          </p>
+
+          <h2>Why it exists</h2>
+          <p>
+            <!-- STARTER TEXT -->
+            One day I was sitting in class listening to music. I saw that femtanyl released ALL THE TIME.
+			Then I remembered about the old Spotify enhancer, and thought, "Maybe I should make one for femtanyl."
+			Then, in just a few hours, Femify was made. An enhancer made for femtanyl/breakcore.
+          </p>
+
+          <h2>The name</h2>
+          <p>
+            <!-- STARTER TEXT -->
+            femtanyl + ify = Femify.
+          </p>
+
+          <h2>Tech</h2>
+          <ul>
+            <li>Python 3.10+, PySide6 (Qt), sounddevice, NumPy, SciPy</li>
+            <li>WASAPI capture/playback at 48 kHz, 2 ch, 1024-block</li>
+            <li>RBJ biquad EQ, musical tanh soft-knee limiter</li>
+            <li>Packaged with PyInstaller as a single .exe</li>
+          </ul>
+
+          <h2>Credits</h2>
+          <p>
+            <!-- STARTER TEXT -->
+            Maker: Paxel
+			Programmer: Paxel
+			Shoutout to femtanyl for amazing music, and the friends that let me talk about this.
+          </p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container footer-inner">
+      <span>© Femify.</span>
+      <span><a href="index.html">Home</a> · <a href="terms.html">Terms</a></span>
+    </div>
+  </footer>
+  <script src="script.js"></script>
+</body>
+</html>

@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Femify — Spotify Enhancer</title>
+  <meta name="description" content="Femify: a Windows audio enhancer tuned for femtanyl — gain, EQ, mono bass, de-harsh, widen, soft limiter." />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <nav class="nav">
+    <div class="nav-inner">
+      <a class="brand" href="index.html"><span class="dot"></span>Femify</a>
+      <button class="menu-btn" aria-label="Menu">☰</button>
+      <div class="nav-links">
+        <a href="index.html">Home</a>
+        <a href="about.html">About</a>
+        <a href="roadmap.html">Roadmap</a>
+        <a href="terms.html">Terms</a>
+        <a class="nav-cta" href="https://github.com/Paxel-GH/Femify" target="_blank" rel="noopener">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <main>
+    <section class="hero">
+      <div class="container hero-grid">
+        <div>
+          <div class="eyebrow">femtanyl mode // maximum hearing</div>
+          <h1>Femify</h1>
+          <p>
+            <!-- STARTER TEXT: replace this intro with your own copy -->
+            A Windows audio enhancer tuned specifically for femtanyl —
+            <strong>ALL THE TIME / KATAMARI / MAN BITES DOG / LOVESICK, CANNIBAL! / PUSH UR T3MPRR</strong>.
+            Push gain 1.5x–5.0x, shape with a 5-band (or advanced 10-band) EQ, mono the bass,
+            de-harsh the highs, widen the stereo image, and land on a musical soft-knee limiter.
+          </p>
+          <div class="hero-actions">
+            <a class="btn btn-primary" href="https://github.com/Paxel-GH/Femify/releases/latest" target="_blank" rel="noopener">⬇ Download for Windows</a>
+            <a class="btn btn-ghost" href="https://github.com/Paxel-GH/Femify" target="_blank" rel="noopener">View on GitHub</a>
+          </div>
+          <p style="margin-top:16px;font-size:13px;color:var(--muted);">
+            <!-- STARTER TEXT: version / status line -->
+            Windows 10/11 · WASAPI · Requires VB-Audio Virtual Cable · v1.1.0
+          </p>
+        </div>
+        <div class="screenshot">
+          <img src="assets/screenshot-main.png" alt="Femify main window" />
+        </div>
+      </div>
+    </section>
+
+    <section class="alt">
+      <div class="container">
+        <h2 class="section-title">What it does</h2>
+        <p class="section-sub">
+          <!-- STARTER TEXT: one-line summary of the app -->
+          Route Spotify through VB-Cable, capture it in Femify, and play the enhanced signal to your headphones.
+        </p>
+        <div class="grid grid-3">
+          <div class="card">
+            <div class="icon">Gain</div>
+            <h3>1.5x – 5.0x gain</h3>
+            <p>Push already-hot masters harder. Hearing-damage warning lights at 3.5x+. Limiter recommended, never forced.</p>
+          </div>
+          <div class="card">
+            <div class="icon">EQ</div>
+            <h3>5-band + advanced 10-band</h3>
+            <p>Sub 55 · Bass 180 · Vox 900 · Harsh 3500 · Air 15000. Toggle advanced ±32dB mode behind a 5s hearing gate.</p>
+          </div>
+          <div class="card">
+            <div class="icon">Pre</div>
+            <h3>Fem presets</h3>
+            <p>Flat, ALL THE TIME, KATAMARI, MAN BITES DOG, LOVESICK, CANNIBAL!, PUSH UR T3MPRR — one click.</p>
+          </div>
+          <div class="card">
+            <div class="icon">Bass</div>
+            <h3>Mono bass &lt;120Hz</h3>
+            <p>Tighten the low end, keep the punch. On by default.</p>
+          </div>
+          <div class="card">
+            <div class="icon">DeH</div>
+            <h3>De-harsh @4k</h3>
+            <p>-3dB notch in the harshness zone. On by default.</p>
+          </div>
+          <div class="card">
+            <div class="icon">Wide</div>
+            <h3>Widen highs +30%</h3>
+            <p>Mid/side stereo widening on the highs only. Off by default.</p>
+          </div>
+          <div class="card">
+            <div class="icon">Lim</div>
+            <h3>Musical soft-knee limiter</h3>
+            <p>Tanh shoulder 0.80 → 0.99. Transients below the knee pass untouched; overs get rounded, not flat-topped.</p>
+          </div>
+          <div class="card">
+            <div class="icon">Mem</div>
+            <h3>Per-mode EQ memory</h3>
+            <p>Switching normal ↔ advanced restores your previous EQ. Settings persist to %APPDATA%\Femify.</p>
+          </div>
+          <div class="card">
+            <div class="icon">Tray</div>
+            <h3>System tray</h3>
+            <p>Runs in the tray, keeps processing while you listen.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="container">
+        <h2 class="section-title">Signal chain</h2>
+        <p class="section-sub">Every block, in order.</p>
+        <div class="chain">
+          <span>Gain 1.5x–5.0x</span><span class="arrow">→</span>
+          <span>DC blocker 10Hz</span><span class="arrow">→</span>
+          <span>5/10-band EQ</span><span class="arrow">→</span>
+          <span>De-harsh 4k</span><span class="arrow">→</span>
+          <span>Mono bass &lt;120Hz</span><span class="arrow">→</span>
+          <span>Widen highs</span><span class="arrow">→</span>
+          <span>Tanh limiter</span><span class="arrow">→</span>
+          <span>Hard clip 0.999</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="alt">
+      <div class="container">
+        <h2 class="section-title">Presets</h2>
+        <p class="section-sub">One-click femtanyl tunings.</p>
+        <div class="chips">
+          <span class="chip accent">Flat</span>
+          <span class="chip">ALL THE TIME</span>
+          <span class="chip">KATAMARI</span>
+          <span class="chip">MAN BITES DOG</span>
+          <span class="chip">LOVESICK, CANNIBAL!</span>
+          <span class="chip">PUSH UR T3MPRR</span>
+        </div>
+        <div style="margin-top:32px;" class="screenshot">
+          <img src="assets/screenshot-eq.png" alt="Femify equalizer view" />
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="container" style="text-align:center;">
+        <h2 class="section-title">Ready to push it?</h2>
+        <p class="section-sub" style="margin:0 auto 24px;">
+          <!-- STARTER TEXT: closing call to action -->
+          Download the Windows build and read the setup guide before you turn it up.
+        </p>
+        <div class="hero-actions" style="justify-content:center;">
+          <a class="btn btn-primary" href="https://github.com/Paxel-GH/Femify/releases/latest" target="_blank" rel="noopener">⬇ Download</a>
+          <a class="btn btn-ghost" href="setup.html">Setup guide</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container footer-inner">
+      <span>© Femify. Windows-only audio enhancer.</span>
+      <span>
+        <a href="terms.html">Terms</a> ·
+        <a href="https://github.com/Paxel-GH/Femify" target="_blank" rel="noopener">GitHub</a>
+      </span>
+    </div>
+  </footer>
+  <script src="script.js"></script>
+</body>
+</html>
