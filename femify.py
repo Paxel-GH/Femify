@@ -12,11 +12,12 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QSlider, QDoubleSpinBox, QGroupBox, QComboBox,
     QPushButton, QCheckBox, QSystemTrayIcon, QMenu, QMessageBox,
-    QStatusBar, QButtonGroup, QStackedWidget, QDialog,
+    QStatusBar, QButtonGroup, QStackedWidget, QDialog, QTabWidget,
 )
 
 from dsp_fem import (
     AudioProcessor, BANDS, FEM_PRESETS, ADV_BANDS, ADV_PRESETS,
+    VSUB_PRESETS,
     EQ_MAX_NORMAL, EQ_MAX_ADV,
     find_device, list_wasapi_devices,
     GAIN_MIN, GAIN_MAX, GAIN_DEFAULT,
@@ -48,6 +49,12 @@ def load_config():
         "mono_bass": True,
         "deharsh": True,
         "widen": False,
+        "vsub_enabled": False,
+        "vsub_level": 0.6,
+        "vsub_harmonic": 0.4,
+        "vsub_crossover": 120.0,
+        "vsub_drive": 0.5,
+        "vsub_resonance": 0.5,
         "input_name": DEFAULT_INPUT,
         "output_name": DEFAULT_OUTPUT,
     }
@@ -200,6 +207,12 @@ class MainWindow(QMainWindow):
             deharsh=self.cfg.get("deharsh", True),
             widen=self.cfg.get("widen", False),
             advanced=self.adv_mode,
+            vsub_enabled=self.cfg.get("vsub_enabled", False),
+            vsub_level=self.cfg.get("vsub_level", 0.6),
+            vsub_harmonic=self.cfg.get("vsub_harmonic", 0.4),
+            vsub_crossover=self.cfg.get("vsub_crossover", 120.0),
+            vsub_drive=self.cfg.get("vsub_drive", 0.5),
+            vsub_resonance=self.cfg.get("vsub_resonance", 0.5),
         )
         self.engine = AudioEngine(self.proc)
         self._save_timer = QTimer(self)
@@ -210,7 +223,7 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle("Femify")
         self.setWindowIcon(make_icon())
-        self.resize(620, 640)
+        self.resize(620, 560)
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -225,6 +238,15 @@ class MainWindow(QMainWindow):
         sub.setObjectName("femSub")
         sub.setAlignment(Qt.AlignCenter)
         root.addWidget(sub)
+
+        # ---- Tabs ----
+        self.tabs = QTabWidget()
+        tab_eq = QWidget()
+        tab_flavor = QWidget()
+        tab_devices = QWidget()
+        eq_layout = QVBoxLayout(tab_eq)
+        flavor_layout = QVBoxLayout(tab_flavor)
+        dev_layout = QVBoxLayout(tab_devices)
 
         # ---- Gain ----
         gain_box = QGroupBox("GAIN (maximum hearing)")
@@ -244,10 +266,14 @@ class MainWindow(QMainWindow):
         gl.addWidget(QLabel("Volume"))
         gl.addWidget(self.gain_slider, 1)
         gl.addWidget(self.gain_spin)
-        root.addWidget(gain_box)
+        eq_layout.addWidget(gain_box)
         self.hearing_label = QLabel("")
         self.hearing_label.setAlignment(Qt.AlignCenter)
         root.addWidget(self.hearing_label)
+        self.tabs.addTab(tab_eq, "EQ")
+        self.tabs.addTab(tab_flavor, "Flavor")
+        self.tabs.addTab(tab_devices, "Devices")
+        root.addWidget(self.tabs)
         self._update_hearing_warning(self.proc.gain)
 
         # ---- EQ (normal 5-band / advanced 10-band pages) ----
@@ -263,7 +289,7 @@ class MainWindow(QMainWindow):
         self._set_page_values(True, self.cfg.get("adv_eq", [0.0] * 10))
         self.eq_stack.setCurrentIndex(1 if self.adv_mode else 0)
         self._refresh_eq_title()
-        root.addWidget(self.eq_box)
+        eq_layout.addWidget(self.eq_box)
 
         # ---- Preset buttons ----
         preset_box = QGroupBox("FEM PRESETS")
@@ -315,7 +341,7 @@ class MainWindow(QMainWindow):
         self.clip_label.setStyleSheet("color: #39ff6a; font-weight: bold;")
         custom_row.addWidget(self.clip_label)
         pv.addLayout(custom_row)
-        root.addWidget(preset_box)
+        eq_layout.addWidget(preset_box)
         self._resync_preset_ui()
 
         # ---- Extras ----
@@ -333,7 +359,65 @@ class MainWindow(QMainWindow):
         el.addWidget(self.mono_check)
         el.addWidget(self.deharsh_check)
         el.addWidget(self.widen_check)
-        root.addWidget(extra_box)
+        flavor_layout.addWidget(extra_box)
+
+        # ---- Virtual Subwoofer ----
+        vs_box = QGroupBox("VIRTUAL SUBWOOFER (sub-bass + harmonic synthesis)")
+        vsv = QVBoxLayout(vs_box)
+        self.vsub_check = QCheckBox("Enable virtual subwoofer")
+        self.vsub_check.setChecked(self.proc.vsub_enabled)
+        self.vsub_check.toggled.connect(self._on_vsub_toggle)
+        vsv.addWidget(self.vsub_check)
+        vs_hint = QLabel("Generates sub-bass (octave down) + harmonic enhancement + "
+                         "port resonance. Simulates a bass-boosted speaker/subwoofer. "
+                         "Additive — original audio preserved.")
+        vs_hint.setWordWrap(True)
+        vs_hint.setStyleSheet("color: #9a9a9a; font-size: 8pt;")
+        vsv.addWidget(vs_hint)
+
+        # vsub presets
+        vs_preset_row = QHBoxLayout()
+        vs_preset_row.addWidget(QLabel("Preset:"))
+        self.vsub_preset_group = QButtonGroup(self)
+        self.vsub_preset_group.setExclusive(True)
+        self.vsub_preset_buttons = {}
+        for name in VSUB_PRESETS:
+            b = QPushButton(name)
+            b.setObjectName("presetBtn")
+            b.clicked.connect(lambda _c, n=name: self._apply_vsub_preset(n))
+            vs_preset_row.addWidget(b)
+            self.vsub_preset_buttons[name] = b
+        vsv.addLayout(vs_preset_row)
+
+        def _slider_row(label, vmin, vmax, val, cb, suffix=""):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            sl = QSlider(Qt.Horizontal)
+            sl.setRange(vmin, vmax)
+            sl.setValue(val)
+            sl.valueChanged.connect(cb)
+            row.addWidget(sl, 1)
+            lbl = QLabel(f"{val}{suffix}")
+            row.addWidget(lbl)
+            vsv.addLayout(row)
+            return sl, lbl
+
+        self.vsub_level_slider, self.vsub_level_label = _slider_row(
+            "Sub Level:", 0, 100, int(self.proc.vsub_level * 100),
+            self._on_vsub_level, "%")
+        self.vsub_harm_slider, self.vsub_harm_label = _slider_row(
+            "Harmonic:", 0, 100, int(self.proc.vsub_harmonic * 100),
+            self._on_vsub_harmonic, "%")
+        self.vsub_cross_slider, self.vsub_cross_label = _slider_row(
+            "Crossover:", 60, 300, int(self.proc.vsub_crossover),
+            self._on_vsub_crossover, " Hz")
+        self.vsub_drive_slider, self.vsub_drive_label = _slider_row(
+            "Drive:", 0, 100, int(self.proc.vsub_drive * 100),
+            self._on_vsub_drive, "%")
+        self.vsub_res_slider, self.vsub_res_label = _slider_row(
+            "Resonance:", 0, 100, int(self.proc.vsub_resonance * 100),
+            self._on_vsub_resonance, "%")
+        flavor_layout.addWidget(vs_box)
 
         # ---- Devices (single output) ----
         dev_box = QGroupBox("DEVICES (WASAPI)")
@@ -353,7 +437,7 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(refresh_btn)
         btn_row.addWidget(self.restart_btn)
         dl.addLayout(btn_row)
-        root.addWidget(dev_box)
+        dev_layout.addWidget(dev_box)
 
         self.status = QStatusBar()
         self.setStatusBar(self.status)
@@ -575,6 +659,68 @@ class MainWindow(QMainWindow):
         self.proc.set_limiter_enabled(on)
         self.schedule_save()
 
+    # ---------- virtual subwoofer ----------
+    def _on_vsub_toggle(self, on):
+        self.proc.set_vsub_enabled(on)
+        self.schedule_save()
+
+    def _on_vsub_level(self, v):
+        self.proc.set_vsub_level(v / 100.0)
+        self.vsub_level_label.setText(f"{v}%")
+        self.schedule_save()
+
+    def _on_vsub_harmonic(self, v):
+        self.proc.set_vsub_harmonic(v / 100.0)
+        self.vsub_harm_label.setText(f"{v}%")
+        self.schedule_save()
+
+    def _on_vsub_crossover(self, v):
+        self.proc.set_vsub_crossover(float(v))
+        self.vsub_cross_label.setText(f"{v} Hz")
+        self.schedule_save()
+
+    def _on_vsub_drive(self, v):
+        self.proc.set_vsub_drive(v / 100.0)
+        self.vsub_drive_label.setText(f"{v}%")
+        self.schedule_save()
+
+    def _on_vsub_resonance(self, v):
+        self.proc.set_vsub_resonance(v / 100.0)
+        self.vsub_res_label.setText(f"{v}%")
+        self.schedule_save()
+
+    def _apply_vsub_preset(self, name):
+        lvl, harm, cross, drive, res = VSUB_PRESETS[name]
+        self.proc.set_vsub_level(lvl)
+        self.proc.set_vsub_harmonic(harm)
+        self.proc.set_vsub_crossover(cross)
+        self.proc.set_vsub_drive(drive)
+        self.proc.set_vsub_resonance(res)
+        # update sliders
+        self.vsub_level_slider.blockSignals(True)
+        self.vsub_level_slider.setValue(int(lvl * 100))
+        self.vsub_level_slider.blockSignals(False)
+        self.vsub_level_label.setText(f"{int(lvl*100)}%")
+        self.vsub_harm_slider.blockSignals(True)
+        self.vsub_harm_slider.setValue(int(harm * 100))
+        self.vsub_harm_slider.blockSignals(False)
+        self.vsub_harm_label.setText(f"{int(harm*100)}%")
+        self.vsub_cross_slider.blockSignals(True)
+        self.vsub_cross_slider.setValue(int(cross))
+        self.vsub_cross_slider.blockSignals(False)
+        self.vsub_cross_label.setText(f"{int(cross)} Hz")
+        self.vsub_drive_slider.blockSignals(True)
+        self.vsub_drive_slider.setValue(int(drive * 100))
+        self.vsub_drive_slider.blockSignals(False)
+        self.vsub_drive_label.setText(f"{int(drive*100)}%")
+        self.vsub_res_slider.blockSignals(True)
+        self.vsub_res_slider.setValue(int(res * 100))
+        self.vsub_res_slider.blockSignals(False)
+        self.vsub_res_label.setText(f"{int(res*100)}%")
+        self.schedule_save()
+
+
+
     # ---------- devices / engine ----------
     def _refresh_devices(self, select_saved=False):
         try:
@@ -631,7 +777,8 @@ class MainWindow(QMainWindow):
         self._save_timer.start()
 
     def _save_now(self):
-        gain, eq, lim, mono, deh, wid, adv = self.proc.get_state()
+        (gain, eq, lim, mono, deh, wid, adv,
+         vs_on, vs_lvl, vs_harm, vs_cross, vs_drive, vs_res) = self.proc.get_state()
         # stash the visible page's live values into the right key
         if adv:
             self.cfg["adv_eq"] = self._page_values(True)
@@ -640,6 +787,9 @@ class MainWindow(QMainWindow):
         self.cfg.update({
             "gain": gain, "limiter": lim,
             "mono_bass": mono, "deharsh": deh, "widen": wid,
+            "vsub_enabled": vs_on, "vsub_level": vs_lvl,
+            "vsub_harmonic": vs_harm, "vsub_crossover": vs_cross,
+            "vsub_drive": vs_drive, "vsub_resonance": vs_res,
             "eq_mode": "advanced" if adv else "normal",
             "preset": self.preset_combo.currentText(),
             "input_name": self.in_combo.currentData() or self.cfg.get("input_name", ""),
