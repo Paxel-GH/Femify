@@ -1,3 +1,23 @@
+"""DSP for Femify: gain (1.5x-5.0x) -> 5-band EQ -> extras -> soft limiter.
+
+Fresh rewrite inspired by Spotify Enhancer's dsp.py, retuned for Femtanyl:
+distorted 808s, fast breaks, pitched-up vocals, already-hot masters.
+
+Chain per block:
+  1. gain (hearing range, default 2.0x)
+  2. DC blocker (10 Hz highpass, always on — kills low-end wander)
+  3. 5-band graphic EQ + optional de-harsh @4kHz in ONE filter pass
+  4. mono bass <120Hz (optional, on by default)
+  5. highs-only stereo widen (optional, off by default)
+  6. musical ceiling limiter: gentle tanh shoulder from 0.80 to 0.99 —
+     transients below the knee pass untouched (punch kept), only real
+     overs get progressively rounded. Memoryless (no attack/release),
+     so no pumping.
+
+Real-time safe: coefficients recomputed only on setter calls,
+filter state (zi) persists across blocks, audio thread never blocks.
+Overflow guard resets filter state instead of blowing up.
+"""
 import numpy as np
 from threading import Lock
 
@@ -67,6 +87,8 @@ ADV_PRESETS = _scale_presets_adv()
 
 GAIN_MIN, GAIN_MAX = 1.50, 5.00
 GAIN_DEFAULT = 2.00
+
+
 
 
 def _biquad(f0, fs, db_gain, ftype, S_Q=1.0):
@@ -215,7 +237,10 @@ class AudioProcessor:
     def __init__(self, samplerate=48000, channels=2, gain=GAIN_DEFAULT,
                  eq_gains=None, limiter_enabled=True,
                  mono_bass=True, deharsh=True, widen=False,
-                 advanced=False):
+                 advanced=False, vsub_enabled=False,
+                 vsub_level=0.6, vsub_harmonic=0.4,
+                 vsub_crossover=120.0, vsub_drive=0.5,
+                 vsub_resonance=0.5):
         self.samplerate = samplerate
         self.channels = channels
         self.lock = Lock()
@@ -226,8 +251,23 @@ class AudioProcessor:
         self.mono_bass = bool(mono_bass)
         self.deharsh = bool(deharsh)
         self.widen = bool(widen)
+        # virtual subwoofer
+        self.vsub_enabled = bool(vsub_enabled)
+        self.vsub_level = float(np.clip(vsub_level, 0.0, 1.0))
+        self.vsub_harmonic = float(np.clip(vsub_harmonic, 0.0, 1.0))
+        self.vsub_crossover = float(np.clip(vsub_crossover, 60.0, 300.0))
+        self.vsub_drive = float(np.clip(vsub_drive, 0.0, 1.0))
+        self.vsub_resonance = float(np.clip(vsub_resonance, 0.0, 1.0))
         self.sos = build_sos(self.eq_gains, samplerate, self.deharsh,
                              self.active_bands)
+        # vsub filter states
+        self.vsub_lp_zi = [np.zeros((1, 2), dtype=np.float64)
+                           for _ in range(channels)]
+        self.vsub_sub_lp_zi = [np.zeros((1, 2), dtype=np.float64)
+                               for _ in range(channels)]
+        self.vsub_res_zi = [np.zeros((1, 2), dtype=np.float64)
+                            for _ in range(channels)]
+        self._rebuild_vsub_filters()
         b0, b1, b2, a1, a2 = _biquad(self.MONO_FREQ, samplerate, 0.0,
                                      "lowpass", 0.707)
         self.mono_sos = np.array([[b0, b1, b2, 1.0, a1, a2]], dtype=np.float64)
@@ -256,6 +296,29 @@ class AudioProcessor:
             self.zi = [np.zeros((new_sos.shape[0], 2), dtype=np.float64)
                        for _ in range(self.channels)]
         self.sos = new_sos
+
+    def _rebuild_vsub_filters(self):
+        sr = self.samplerate
+        co = self.vsub_crossover
+        # low-pass at crossover for bass extraction
+        b0, b1, b2, a1, a2 = _biquad(co, sr, 0.0, "lowpass", 0.707)
+        self.vsub_lp_sos = np.array([[b0, b1, b2, 1.0, a1, a2]],
+                                    dtype=np.float64)
+        # low-pass at crossover/2 for subharmonic isolation
+        sub_co = max(30.0, co / 2.0)
+        b0, b1, b2, a1, a2 = _biquad(sub_co, sr, 0.0, "lowpass", 0.707)
+        self.vsub_sub_lp_sos = np.array([[b0, b1, b2, 1.0, a1, a2]],
+                                        dtype=np.float64)
+        # peaking EQ at 65Hz for port resonance (gain scaled by resonance)
+        res_gain = self.vsub_resonance * 12.0
+        b0, b1, b2, a1, a2 = _biquad(65.0, sr, res_gain, "peak", 2.0)
+        self.vsub_res_sos = np.array([[b0, b1, b2, 1.0, a1, a2]],
+                                     dtype=np.float64)
+        # reset filter states
+        for ch in range(self.channels):
+            self.vsub_lp_zi[ch][:] = 0.0
+            self.vsub_sub_lp_zi[ch][:] = 0.0
+            self.vsub_res_zi[ch][:] = 0.0
 
     # ---- UI thread setters ----
     def set_gain(self, g):
@@ -301,10 +364,41 @@ class AudioProcessor:
         with self.lock:
             self.widen = bool(on)
 
+    def set_vsub_enabled(self, on):
+        with self.lock:
+            self.vsub_enabled = bool(on)
+
+    def set_vsub_level(self, v):
+        with self.lock:
+            self.vsub_level = float(np.clip(v, 0.0, 1.0))
+
+    def set_vsub_harmonic(self, v):
+        with self.lock:
+            self.vsub_harmonic = float(np.clip(v, 0.0, 1.0))
+
+    def set_vsub_crossover(self, v):
+        with self.lock:
+            self.vsub_crossover = float(np.clip(v, 60.0, 300.0))
+            self._rebuild_vsub_filters()
+
+    def set_vsub_drive(self, v):
+        with self.lock:
+            self.vsub_drive = float(np.clip(v, 0.0, 1.0))
+
+    def set_vsub_resonance(self, v):
+        with self.lock:
+            self.vsub_resonance = float(np.clip(v, 0.0, 1.0))
+            self._rebuild_vsub_filters()
+
+
+
+
     def get_state(self):
         with self.lock:
             return (self.gain, list(self.eq_gains), self.limiter_enabled,
-                    self.mono_bass, self.deharsh, self.widen, self.advanced)
+                    self.mono_bass, self.deharsh, self.widen, self.advanced,
+                    self.vsub_enabled, self.vsub_level, self.vsub_harmonic,
+                    self.vsub_crossover, self.vsub_drive, self.vsub_resonance)
 
     def reset(self):
         with self.lock:
@@ -312,6 +406,10 @@ class AudioProcessor:
                        for _ in range(self.channels)]
             self.zi_mono = [np.zeros((1, 2), dtype=np.float64)
                             for _ in range(self.channels)]
+            for ch in range(self.channels):
+                self.vsub_lp_zi[ch][:] = 0.0
+                self.vsub_sub_lp_zi[ch][:] = 0.0
+                self.vsub_res_zi[ch][:] = 0.0
             self._clip_flag = False
 
     def poll_clip(self):
@@ -392,6 +490,57 @@ class AudioProcessor:
                 highs[:, 1] = mid + side1 * k
             audio = (lows + highs).astype(np.float32, copy=False)
 
+        # Virtual subwoofer: generate sub-bass + harmonics + port resonance.
+        # Additive — original audio preserved, vsub content layered on top.
+        with self.lock:
+            vs_on = self.vsub_enabled
+            vs_level = self.vsub_level
+            vs_harm = self.vsub_harmonic
+            vs_drive = self.vsub_drive
+            vs_res = self.vsub_resonance
+            vs_lp_sos = self.vsub_lp_sos.copy()
+            vs_sub_lp_sos = self.vsub_sub_lp_sos.copy()
+            vs_res_sos = self.vsub_res_sos.copy()
+
+        if vs_on:
+            n = audio.shape[0]
+            for ch in range(min(self.channels, audio.shape[1])):
+                ch_audio = audio[:, ch].astype(np.float64)
+
+                # extract bass
+                bass, zf = sosfilt(vs_lp_sos, ch_audio,
+                                   zi=self.vsub_lp_zi[ch])
+                self.vsub_lp_zi[ch] = zf
+                bass = np.asarray(bass, dtype=np.float64)
+
+                # subharmonic: half-wave rectify bass, low-pass at crossover/2
+                hw = np.where(bass > 0, bass, 0.0)
+                sub, zf = sosfilt(vs_sub_lp_sos, hw,
+                                  zi=self.vsub_sub_lp_zi[ch])
+                self.vsub_sub_lp_zi[ch] = zf
+                sub = np.asarray(sub, dtype=np.float64) * 2.0
+
+                # harmonic: soft-clip bass, subtract original for harmonic content
+                drive_factor = 1.0 + vs_drive * 4.0
+                denom = np.tanh(drive_factor)
+                if abs(denom) < 1e-9:
+                    denom = 1e-9
+                clipped = np.tanh(bass * drive_factor) / denom
+                harmonic = (clipped - bass) * vs_harm
+
+                # port resonance: peaking EQ on bass, subtract for delta
+                res_bass, zf = sosfilt(vs_res_sos, bass,
+                                       zi=self.vsub_res_zi[ch])
+                self.vsub_res_zi[ch] = zf
+                res_bass = np.asarray(res_bass, dtype=np.float64)
+                resonance = (res_bass - bass) * vs_res
+
+                # mix additive
+                audio[:, ch] = (ch_audio +
+                                vs_level * sub +
+                                harmonic +
+                                resonance).astype(np.float32)
+
         # Musical ceiling limiter: knee 0.80 with a wide 0.19 tanh shoulder.
         # Below-knee transients pass bit-clean (punch kept); overs get
         # progressively rounded instead of flat-topped. Memoryless, so
@@ -416,3 +565,12 @@ class AudioProcessor:
 
         np.clip(audio, -0.999, 0.999, out=audio)
         return audio
+
+
+# Virtual subwoofer presets: (level, harmonic, crossover, drive, resonance)
+VSUB_PRESETS = {
+    "Low": (0.30, 0.20, 100.0, 0.20, 0.20),
+    "Med": (0.50, 0.40, 120.0, 0.40, 0.40),
+    "High": (0.80, 0.60, 140.0, 0.60, 0.60),
+    "Femified": (0.90, 0.70, 130.0, 0.80, 0.80),
+}
