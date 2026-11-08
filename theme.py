@@ -1,3 +1,7 @@
+"""Femify theme — PUSH UR T3MPRR / LOVESICK, CANNIBAL! era.
+
+Harsh black/white, blood-red / hot-pink, chunky cute-brutal.
+"""
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QPolygon, QFont
 from PySide6.QtCore import QPoint
 
