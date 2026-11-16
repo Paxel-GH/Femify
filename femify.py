@@ -23,6 +23,7 @@ from dsp_fem import (
     GAIN_MIN, GAIN_MAX, GAIN_DEFAULT,
 )
 from theme import apply_theme, make_icon, ACCENT
+import audio_duck
 
 SAMPLERATE = 48000
 CHANNELS = 2
@@ -180,6 +181,11 @@ class AudioEngine:
         )
         self.stream.start()
         self.running = True
+        # opt out of Windows communication ducking (always on)
+        try:
+            audio_duck.disable_ducking_for_pid()
+        except Exception:
+            pass
 
     def stop(self):
         try:
@@ -831,6 +837,11 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    # disable Windows communication ducking globally (always on)
+    try:
+        audio_duck.disable_ducking_registry()
+    except Exception:
+        pass
     app = QApplication(sys.argv)
     apply_theme(app)
     app.setQuitOnLastWindowClosed(False)
